@@ -1,0 +1,174 @@
+// ==========================================
+//      NAVISENSE: BELT RECEIVER v3.1
+//    (Custom Ranges + Cliff Priority)
+// ==========================================
+#include <esp_now.h>
+#include <WiFi.h>
+
+// --- 1. PIN DEFINITIONS ---
+#define PIN_MOTOR_LEFT   26
+#define PIN_MOTOR_FRONT  27
+#define PIN_MOTOR_RIGHT  14
+#define PIN_LED_GREEN    32
+#define PIN_LED_RED      33
+
+// --- 2. DATA STRUCTURE ---
+typedef struct struct_message {
+  int distanceL;
+  int distanceF;
+  int distanceR;
+  bool dangerWarning; 
+  bool fallDetected; 
+  bool cliffDetected; 
+  bool sosActive; 
+  bool musicActive;
+} struct_message;
+
+struct_message incomingData;
+
+// --- 3. GLOBAL VARIABLES ---
+unsigned long lastDataTime = 0;
+bool isConnected = false;
+
+// LED Timers
+unsigned long ledTimer = 0;
+bool redState = LOW;
+
+// Motor Timers
+unsigned long timerF = 0;
+unsigned long timerL = 0;
+unsigned long timerR = 0;
+
+// Motor States
+bool stateF = false;
+bool stateL = false;
+bool stateR = false;
+
+// --- 4. CALLBACK FUNCTION ---
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingBytes, int len) {
+  memcpy(&incomingData, incomingBytes, sizeof(incomingData));
+  lastDataTime = millis();
+}
+
+// --- 5. HELPER: RUN MOTOR LOGIC ---
+// Pin = Motor Pin
+// Dist = Current Distance
+// maxDist = Where vibration STARTS (e.g., 50cm)
+// minDist = Where vibration becomes CONTINUOUS (e.g., 15cm)
+void handleMotor(int pin, int dist, int maxDist, int minDist, unsigned long &timer, bool &state) {
+  unsigned long currentMillis = millis();
+
+  // CASE 1: Out of Range -> STOP
+  if (dist > maxDist || dist <= 0) {
+    digitalWrite(pin, LOW);
+    state = false;
+    return;
+  }
+
+  // CASE 2: Very Close -> CONTINUOUS
+  if (dist < minDist) {
+    digitalWrite(pin, HIGH);
+    state = true;
+    return;
+  }
+
+  // CASE 3: In Range -> PULSE
+  // Map distance to Interval (Far = 800ms, Close = 50ms)
+  int interval = map(dist, minDist, maxDist, 50, 800);
+  
+  if (currentMillis - timer > interval) {
+    timer = currentMillis;
+    state = !state; // Toggle ON/OFF
+    digitalWrite(pin, state ? HIGH : LOW);
+  }
+}
+
+// ==========================================
+//            MAIN SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_MOTOR_LEFT, OUTPUT);
+  pinMode(PIN_MOTOR_FRONT, OUTPUT);
+  pinMode(PIN_MOTOR_RIGHT, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    return;
+  }
+  esp_now_register_recv_cb((esp_now_recv_cb_t)OnDataRecv);
+
+  Serial.println(">> BELT v3.1 READY");
+}
+
+// ==========================================
+//            MAIN LOOP
+// ==========================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. CHECK CONNECTION STATUS
+  if (currentMillis - lastDataTime > 2000) {
+    isConnected = false;
+  } else {
+    isConnected = true;
+  }
+
+  // 2. LOGIC WHEN DISCONNECTED
+  if (!isConnected) {
+    digitalWrite(PIN_LED_GREEN, LOW); 
+    // Blink Red Fast
+    if (currentMillis - ledTimer > 300) { 
+      ledTimer = currentMillis;
+      redState = !redState;
+      digitalWrite(PIN_LED_RED, redState);
+    }
+    // Kill Motors
+    digitalWrite(PIN_MOTOR_LEFT, LOW);
+    digitalWrite(PIN_MOTOR_FRONT, LOW);
+    digitalWrite(PIN_MOTOR_RIGHT, LOW);
+    return; // Skip everything else
+  } 
+
+  // 3. LOGIC WHEN CONNECTED
+  
+  // LED Status
+  digitalWrite(PIN_LED_GREEN, HIGH); // Green SOLID
+  // Red Heartbeat (Every 4s)
+  if (currentMillis % 4000 < 100) digitalWrite(PIN_LED_RED, HIGH);
+  else digitalWrite(PIN_LED_RED, LOW);
+
+  // --- PRIORITY 1: CLIFF DETECTION ---
+  // If Cliff is detected, vibrate ALL motors continuously
+  if (incomingData.cliffDetected) {
+    digitalWrite(PIN_MOTOR_LEFT, HIGH);
+    digitalWrite(PIN_MOTOR_FRONT, HIGH);
+    digitalWrite(PIN_MOTOR_RIGHT, HIGH);
+    return; // Override everything else
+  }
+
+  // --- PRIORITY 2: SOS / MUSIC / FALL ---
+  if (incomingData.sosActive || incomingData.musicActive || incomingData.fallDetected) {
+     digitalWrite(PIN_MOTOR_LEFT, HIGH);
+     digitalWrite(PIN_MOTOR_FRONT, HIGH);
+     digitalWrite(PIN_MOTOR_RIGHT, HIGH);
+     return; 
+  }
+
+  // --- PRIORITY 3: NAVIGATION (Updated Ranges) ---
+  
+  // FRONT: 50cm Start -> 15cm Solid
+  handleMotor(PIN_MOTOR_FRONT, incomingData.distanceF, 50, 15, timerF, stateF);
+  
+  // LEFT: 40cm Start -> 10cm Solid
+  handleMotor(PIN_MOTOR_LEFT, incomingData.distanceL, 40, 10, timerL, stateL);
+  
+  // RIGHT: 30cm Start -> 10cm Solid
+  handleMotor(PIN_MOTOR_RIGHT, incomingData.distanceR, 30, 10, timerR, stateR);
+
+  delay(10);
+}

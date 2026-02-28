@@ -1,0 +1,472 @@
+// ==========================================
+//        NAVISENSE: MASTER CODE v3.8
+//    (Melodious Party Mode + Full Features)
+// ==========================================
+#include <Wire.h> 
+#include <Arduino.h>
+
+// --- 1. PIN DEFINITIONS ---
+#define PIN_LDR_INPUT   34   // Day/Night Sensor
+#define PIN_LED_OUTPUT  2    // Torch
+#define PIN_LEDS_RED    32   // Warning LEDs
+#define PIN_BTN_STOP    4    // Sleep/Wake Button
+#define PIN_BTN_SOS     5    // SOS (Single) / Music (Double)
+#define PIN_IR_CLIFF    23   // Cliff Sensor (IR)
+
+// AUDIO
+#define PIN_BUZZ_ACT    18   // Active Buzzer (The Beat)
+#define PIN_BUZZ_PAS    15   // Passive Buzzer (The Melody)
+
+// ULTRASONICS
+#define TRIG_LEFT   13
+#define ECHO_LEFT   12
+#define TRIG_FRONT  14
+#define ECHO_FRONT  27
+#define TRIG_RIGHT  26
+#define ECHO_RIGHT  25
+
+// GYRO (ADXL345)
+#define SDA_PIN     21
+#define SCL_PIN     22
+#define ADXL_ADDR   0x53 
+
+// --- 2. GLOBAL VARIABLES ---
+long distLeft, distFront, distRight;
+
+// Timers
+unsigned long previousBeepMillis = 0;
+unsigned long previousSirenMillis = 0;
+unsigned long previousMusicBeat = 0; // For Active Buzzer Beat
+unsigned long previousMusicNote = 0; // For Passive Buzzer Melody
+unsigned long closeProximityTimer = 0; 
+unsigned long blinkTimer = 0;
+unsigned long fallTimer = 0;
+unsigned long uprightTimer = 0;
+unsigned long debounceSTOP = 0;
+
+// SOS Button Logic
+int sosClickCount = 0;
+unsigned long lastSOSClickTime = 0;
+bool isSOSButtonReleased = true;
+
+// States
+bool redLedState = LOW;
+bool isRedFlashActive = false; 
+bool isFallAlarmActive = false; 
+bool isCliffAlarmActive = false;
+bool isSystemSleeping = false;  
+bool isStickFlat = false;       
+
+// Master Modes
+bool isSOSActive = false;   
+bool isMusicActive = false; 
+
+// Siren Variables
+int sirenPitch = 600;
+int sirenDir = 20;
+
+// Music Variables
+int melodyIndex = 0;
+// A fast, cyber-style arpeggio (C Major climb)
+int melody[] = {523, 659, 784, 1046, 784, 659}; 
+int melodyLen = 6;
+
+// --- 3. DATA STRUCTURE FOR BELT ---
+typedef struct struct_message {
+  int distanceL;
+  int distanceF;
+  int distanceR;
+  bool dangerWarning; 
+  bool fallDetected; 
+  bool cliffDetected; 
+  bool sosActive; 
+} struct_message;
+
+struct_message beltData; 
+
+// ==========================================
+//            HELPER FUNCTIONS
+// ==========================================
+
+void initADXL() {
+  Wire.begin(SDA_PIN, SCL_PIN); 
+  delay(10);
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(0x2D); Wire.write(8); Wire.endTransmission();
+}
+
+int readAccelX() {
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(0x32); Wire.endTransmission();
+  Wire.requestFrom(ADXL_ADDR, 2);
+  if (Wire.available() >= 2) {
+    int x0 = Wire.read(); int x1 = Wire.read();
+    return abs((x1 << 8) | x0);
+  }
+  return 255; 
+}
+
+// --- SOUNDS ---
+void playBootSound() {
+  int m[] = {523, 659, 784, 1046}; 
+  for(int i=0; i<4; i++) {
+    ledcWriteTone(PIN_BUZZ_PAS, m[i]); delay(100);
+  }
+  ledcWriteTone(PIN_BUZZ_PAS, 0);
+}
+
+void playWakeSound() {
+  int n[] = {523, 659, 784}; 
+  for(int i=0; i<3; i++) {
+    ledcWriteTone(PIN_BUZZ_PAS, n[i]); delay(150);
+  }
+  ledcWriteTone(PIN_BUZZ_PAS, 0);
+}
+
+void playSleepSound() {
+  int n[] = {784, 659, 523}; 
+  for(int i=0; i<3; i++) {
+    ledcWriteTone(PIN_BUZZ_PAS, n[i]); delay(150);
+  }
+  ledcWriteTone(PIN_BUZZ_PAS, 0);
+}
+
+void playCliffTone() {
+  if ((millis() / 150) % 2 == 0) ledcWriteTone(PIN_BUZZ_PAS, 2000); 
+  else ledcWriteTone(PIN_BUZZ_PAS, 800); 
+}
+
+// --- LIGHTING ---
+void checkDayNight() {
+  if (!isSystemSleeping && digitalRead(PIN_LDR_INPUT) == HIGH) 
+    digitalWrite(PIN_LED_OUTPUT, HIGH);
+  else 
+    digitalWrite(PIN_LED_OUTPUT, LOW);
+}
+
+// --- FILTERED READING ---
+long getFilteredDistance(int trigPin, int echoPin) {
+  long total = 0;
+  int validReadings = 0;
+  for (int i = 0; i < 3; i++) { 
+    digitalWrite(trigPin, LOW); delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    long duration = pulseIn(echoPin, HIGH, 18000); 
+    long distance = duration * 0.034 / 2;
+    if (distance >= 2 && distance <= 400) { 
+      total += distance; validReadings++;
+    }
+    delay(2);
+  }
+  if (validReadings == 0) return 999; 
+  return total / validReadings;
+}
+
+// ==========================================
+//          LOGIC MODULES
+// ==========================================
+
+// --- 1. SMART SOS BUTTON ---
+void checkSOSButton() {
+  unsigned long currentMillis = millis();
+  
+  if (digitalRead(PIN_BTN_SOS) == LOW) {
+    if (isSOSButtonReleased) {
+      isSOSButtonReleased = false; 
+      sosClickCount++;
+      lastSOSClickTime = currentMillis;
+    }
+  } else {
+    isSOSButtonReleased = true;
+  }
+
+  // Process Clicks (Wait 400ms)
+  if (sosClickCount > 0 && (currentMillis - lastSOSClickTime > 400)) {
+    if (isSOSActive || isMusicActive) {
+      // STOP EVERYTHING
+      isSOSActive = false; isMusicActive = false;
+      ledcWriteTone(PIN_BUZZ_PAS, 0);
+      digitalWrite(PIN_BUZZ_ACT, LOW);
+      digitalWrite(PIN_LEDS_RED, LOW);
+    }
+    else {
+      // START MODES
+      if (sosClickCount == 1) { isSOSActive = true; isMusicActive = false; }
+      else if (sosClickCount >= 2) { isMusicActive = true; isSOSActive = false; }
+    }
+    sosClickCount = 0;
+  }
+  beltData.sosActive = isSOSActive;
+}
+
+// --- 2. RUN SOS AUDIO (VAO VAO) ---
+void runSOSRoutine() {
+  unsigned long currentMillis = millis();
+  
+  // Flash 5 times/sec (200ms cycle -> 100ms ON)
+  if (currentMillis - blinkTimer > 100) {
+    blinkTimer = currentMillis;
+    redLedState = !redLedState;
+    digitalWrite(PIN_LEDS_RED, redLedState);
+  }
+  
+  // Vao Vao Sweep
+  if (currentMillis - previousSirenMillis > 10) { 
+    previousSirenMillis = currentMillis;
+    sirenPitch += sirenDir;
+    if (sirenPitch >= 2000 || sirenPitch <= 600) sirenDir = -sirenDir;
+    
+    ledcWriteTone(PIN_BUZZ_PAS, sirenPitch);
+    
+    // Active Buzzer "Grating"
+    if (sirenPitch > 1500 && (currentMillis % 40 < 20)) digitalWrite(PIN_BUZZ_ACT, HIGH);
+    else digitalWrite(PIN_BUZZ_ACT, LOW);
+  }
+}
+
+// --- 3. RUN MELODIOUS MUSIC ROUTINE ---
+void runMusicRoutine() {
+  unsigned long currentMillis = millis();
+  
+  // A. ACTIVE BUZZER (The Beat) - Every 450ms
+  if (currentMillis - previousMusicBeat > 450) {
+    previousMusicBeat = currentMillis;
+    digitalWrite(PIN_BUZZ_ACT, HIGH); // Click ON
+    digitalWrite(PIN_LEDS_RED, HIGH); // Flash ON
+    // Turn off quickly in main loop
+  } 
+  else if (currentMillis - previousMusicBeat > 50) {
+    digitalWrite(PIN_BUZZ_ACT, LOW);  // Click OFF
+    digitalWrite(PIN_LEDS_RED, LOW);  // Flash OFF
+  }
+
+  // B. PASSIVE BUZZER (The Melody) - Every 150ms (3 notes per beat)
+  if (currentMillis - previousMusicNote > 150) {
+    previousMusicNote = currentMillis;
+    
+    // Play Note
+    ledcWriteTone(PIN_BUZZ_PAS, melody[melodyIndex]);
+    
+    // Advance Melody
+    melodyIndex++;
+    if (melodyIndex >= melodyLen) melodyIndex = 0;
+  }
+}
+
+// --- 4. FALL LOGIC ---
+void checkFallLogic() {
+  if (isSystemSleeping || isSOSActive || isMusicActive) return;
+
+  int xVal = readAccelX();
+  unsigned long currentMillis = millis();
+
+  if (xVal < 60) {
+    uprightTimer = 0; 
+    if (fallTimer == 0) fallTimer = currentMillis;
+    else {
+      unsigned long duration = currentMillis - fallTimer;
+      if (duration > 2000) isStickFlat = true;
+      if (duration > 10000) isFallAlarmActive = true; 
+    }
+  }
+  else if (xVal > 160) {
+    fallTimer = 0; 
+    isStickFlat = false; 
+    if (isFallAlarmActive) {
+      if (uprightTimer == 0) uprightTimer = currentMillis;
+      else if (currentMillis - uprightTimer > 2000) { 
+        isFallAlarmActive = false;
+        ledcWriteTone(PIN_BUZZ_PAS, 0); 
+        digitalWrite(PIN_LEDS_RED, LOW);
+      }
+    }
+  } 
+  else uprightTimer = 0;
+  
+  beltData.fallDetected = isFallAlarmActive;
+}
+
+// --- 5. CLIFF LOGIC ---
+void checkCliffLogic() {
+  if (isSystemSleeping || isSOSActive || isMusicActive) return;
+  if (isStickFlat) { isCliffAlarmActive = false; return; }
+
+  if (digitalRead(PIN_IR_CLIFF) == HIGH) isCliffAlarmActive = true;
+  else isCliffAlarmActive = false;
+  
+  beltData.cliffDetected = isCliffAlarmActive;
+}
+
+// --- 6. RED LIGHT WARNING ---
+void checkRedLightWarning(long f, long l, long r) {
+  if (isSOSActive || isMusicActive) return; // Modes handle lights
+  if (isSystemSleeping) { digitalWrite(PIN_LEDS_RED, LOW); return; }
+  
+  unsigned long currentMillis = millis();
+  int triggerTime = 0;
+  
+  if (f < 30 || l < 30 || r < 30) triggerTime = 1000; 
+  else if (f < 50 || l < 50 || r < 50) triggerTime = 2000;
+  
+  if (triggerTime > 0) {
+    if (closeProximityTimer == 0) closeProximityTimer = currentMillis; 
+    else if (currentMillis - closeProximityTimer > triggerTime) isRedFlashActive = true;
+  } else {
+    closeProximityTimer = 0;
+    isRedFlashActive = false;
+  }
+
+  int blinkSpeed = 0;
+  if (isCliffAlarmActive) blinkSpeed = 166; 
+  else if (isRedFlashActive || isFallAlarmActive) blinkSpeed = 200; 
+  
+  if (blinkSpeed > 0) {
+    if (currentMillis - blinkTimer > blinkSpeed) { 
+      blinkTimer = currentMillis;
+      redLedState = !redLedState;
+      digitalWrite(PIN_LEDS_RED, redLedState);
+    }
+    beltData.dangerWarning = true;
+  } else {
+    beltData.dangerWarning = false;
+    digitalWrite(PIN_LEDS_RED, LOW);
+  }
+}
+
+// --- 7. SLEEP TOGGLE ---
+void checkButtonD4() {
+  if (digitalRead(PIN_BTN_STOP) == LOW) {
+    if (millis() - debounceSTOP > 500) { 
+      debounceSTOP = millis();
+      
+      if (isSystemSleeping) {
+        isSystemSleeping = false;
+        playWakeSound(); 
+        fallTimer = 0; isFallAlarmActive = false; isStickFlat = false;
+      } 
+      else {
+        isSystemSleeping = true;
+        isSOSActive = false; isMusicActive = false;
+        playSleepSound(); 
+        isFallAlarmActive = false; isStickFlat = false; isRedFlashActive = false; isCliffAlarmActive = false;
+        ledcWriteTone(PIN_BUZZ_PAS, 0); 
+        digitalWrite(PIN_BUZZ_ACT, LOW);
+        digitalWrite(PIN_LEDS_RED, LOW);
+        digitalWrite(PIN_LED_OUTPUT, LOW);
+      }
+    }
+  }
+}
+
+// --- 8. BUZZER LOGIC ---
+void runBuzzerLogic(long front, long left, long right) {
+  if (isSystemSleeping || isSOSActive || isMusicActive) return;
+
+  unsigned long currentMillis = millis();
+
+  // A. PASSIVE (Siren/Cliff)
+  if (isFallAlarmActive) {
+     if (currentMillis - previousSirenMillis > 15) {
+        previousSirenMillis = currentMillis;
+        sirenPitch += sirenDir;
+        if (sirenPitch >= 2000 || sirenPitch <= 600) sirenDir = -sirenDir;
+        ledcWriteTone(PIN_BUZZ_PAS, sirenPitch);
+     }
+  } 
+  else if (isCliffAlarmActive) {
+    playCliffTone();
+  }
+  else {
+    ledcWriteTone(PIN_BUZZ_PAS, 0); 
+  }
+  
+  // B. ACTIVE (Nav Beeps)
+  if (isStickFlat || isFallAlarmActive || isCliffAlarmActive) return;
+
+  int beepInterval = 0;
+  if (front > 300) beepInterval = 4000;      
+  else if (front > 200) beepInterval = 2000; 
+  else if (front > 90) beepInterval = 1000;  
+  else {
+    int safeDist = constrain(front, 10, 90);
+    beepInterval = map(safeDist, 10, 90, 50, 1000);
+  }
+
+  int sideInterval = 0;
+  if (left < 70) {
+     int safeL = constrain(left, 10, 70);
+     int i = map(safeL, 10, 70, 50, 1000);
+     if(sideInterval == 0 || i < sideInterval) sideInterval = i;
+  }
+  if (right < 50) {
+     int safeR = constrain(right, 10, 50);
+     int i = map(safeR, 10, 50, 50, 1000);
+     if(sideInterval == 0 || i < sideInterval) sideInterval = i;
+  }
+  if (sideInterval > 0 && sideInterval < beepInterval) beepInterval = sideInterval;
+
+  if (beepInterval > 0) {
+    if (currentMillis - previousBeepMillis >= beepInterval) {
+      previousBeepMillis = currentMillis;
+      int beepLen = (beepInterval < 100) ? 20 : 50;
+      digitalWrite(PIN_BUZZ_ACT, HIGH); delay(beepLen); digitalWrite(PIN_BUZZ_ACT, LOW);
+    }
+  }
+}
+
+// ==========================================
+//            MAIN SETUP & LOOP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // Pins
+  pinMode(PIN_LDR_INPUT, INPUT);
+  pinMode(PIN_LED_OUTPUT, OUTPUT);
+  pinMode(PIN_LEDS_RED, OUTPUT);
+  pinMode(PIN_BTN_STOP, INPUT_PULLUP);
+  pinMode(PIN_BTN_SOS, INPUT_PULLUP);
+  pinMode(PIN_IR_CLIFF, INPUT_PULLUP);
+  
+  pinMode(PIN_BUZZ_ACT, OUTPUT);
+  pinMode(PIN_BUZZ_PAS, OUTPUT); 
+  
+  pinMode(TRIG_LEFT, OUTPUT); pinMode(ECHO_LEFT, INPUT);
+  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
+
+  initADXL();
+  ledcAttach(PIN_BUZZ_PAS, 2000, 8); 
+
+  playBootSound();
+  
+  Serial.println(">> NAVISENSE v3.8: MELODIOUS MUSIC READY");
+  Serial.println(">> PENDING: ESP-NOW Code for Belt & Battery Monitor");
+}
+
+void loop() {
+  // 1. BUTTONS & MODES
+  checkButtonD4(); 
+  checkSOSButton();
+
+  if (isSOSActive) { runSOSRoutine(); return; }
+  if (isMusicActive) { runMusicRoutine(); return; }
+  if (isSystemSleeping) { delay(50); return; }
+
+  // 2. SENSORS
+  checkDayNight();
+  distLeft  = getFilteredDistance(TRIG_LEFT, ECHO_LEFT);
+  distFront = getFilteredDistance(TRIG_FRONT, ECHO_FRONT); 
+  distRight = getFilteredDistance(TRIG_RIGHT, ECHO_RIGHT);
+  
+  beltData.distanceL = distLeft;
+  beltData.distanceF = distFront;
+  beltData.distanceR = distRight;
+
+  // 3. LOGIC
+  checkFallLogic(); 
+  checkCliffLogic(); 
+  checkRedLightWarning(distFront, distLeft, distRight); 
+  runBuzzerLogic(distFront, distLeft, distRight); 
+}
